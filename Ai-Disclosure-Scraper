@@ -1,0 +1,103 @@
+import pandas as pd
+import requests
+import time
+import urllib.parse
+import os
+import re
+from bs4 import BeautifulSoup
+
+INPUT_FILE = 'steamdb-info-2026-10-29 - kopie.csv'
+OUTPUT_FILE = 'steam_games_with_ai_disclosure.csv'
+BATCH_SAVE_INTERVAL = 50
+
+def get_steam_ai_disclosure(game_name):
+    """
+    Zoekt de game op via de Steam Search API en haalt op een flexibele manier de AI-disclosure op.
+    """
+    search_url = f"https://store.steampowered.com/api/storesearch/?term={urllib.parse.quote(game_name)}&l=english&cc=US"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    try:
+        response = requests.get(search_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('items', [])
+            if items:
+                app_id = items[0]['id']
+                matched_title = items[0]['name']
+
+                # Bezoek de winkelpagina om de AI-disclosure te scrapen
+                store_url = f"https://store.steampowered.com/app/{app_id}/?l=english"
+                store_res = requests.get(store_url, headers=headers, timeout=10)
+
+                ai_disclosure_text = ""
+                if store_res.status_code == 200:
+                    soup = BeautifulSoup(store_res.text, 'html.parser')
+
+                    # Methode 1: Zoek direct naar de officiële Steam disclosure-container
+                    disclosure_block = soup.find('div', class_='developer_disclosure_block')
+                    if disclosure_block:
+                        block_text = disclosure_block.get_text().strip()
+                        # Controleer of deze disclosure specifiek over AI gaat
+                        if any(term in block_text.lower() for term in ["ai generated", "artificial intelligence", "uses ai"]):
+                            ai_disclosure_text = block_text
+
+                    # Methode 2: Flexibele fallback als de container-class anders is
+                    if not ai_disclosure_text:
+                        # Zoek naar elk element dat tekst bevat over hoe de game AI gebruikt (hoofdletterongevoelig)
+                        ai_pattern = re.compile(r"how\s+their\s+game\s+uses\s+ai\s+generated\s+content", re.IGNORECASE)
+                        matching_element = soup.find(text=ai_pattern)
+                        if matching_element:
+                            parent_container = matching_element.find_parent('div')
+                            if parent_container:
+                                ai_disclosure_text = parent_container.get_text().strip()
+
+                # Verwijder overtollige witruimtes, returns en tabs
+                if ai_disclosure_text:
+                    ai_disclosure_text = " ".join(ai_disclosure_text.split())
+
+                return app_id, matched_title, ai_disclosure_text
+    except Exception as e:
+        print(f"Fout bij ophalen voor {game_name}: {e}")
+
+    return None, None, ""
+
+def main():
+    print(f"Laden van {INPUT_FILE}...")
+    if not os.path.exists(INPUT_FILE):
+        print(f"Fout: {INPUT_FILE} niet gevonden! Zorg dat het bestand aanwezig is.")
+        return
+
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        games = [line.strip().lstrip('\ufeff') for line in f if line.strip()]
+
+    print(f"Totaal {len(games)} games gevonden. Starten vanaf de eerste game op de lijst...")
+
+    results = []
+
+    # We negeren eventuele eerdere bestanden om geforceerd bij de allereerste game te starten
+    for idx, game in enumerate(games, 1):
+        print(f"[{idx}/{len(games)}] Zoeken naar AI disclosure voor: {game}")
+        app_id, matched_title, ai_disclosure = get_steam_ai_disclosure(game)
+
+        results.append({
+            'Original_Name': game,
+            'Steam_App_ID': app_id if app_id else "",
+            'Steam_Matched_Title': matched_title if matched_title else "",
+            'AI_Generated_Content_Disclosure': ai_disclosure
+        })
+
+        time.sleep(1.0)
+
+        if len(results) % BATCH_SAVE_INTERVAL == 0:
+            df_temp = pd.DataFrame(results)
+            df_temp.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+            print(f"--- Voortgang opgeslagen ({len(results)} games verwerkt) ---")
+
+    df_final = pd.DataFrame(results)
+    df_final.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+    print(f"Klaar! Resultaten opgeslagen in {OUTPUT_FILE}")
+    display(df_final.head(10))
+
+if __name__ == '__main__':
+    main()
