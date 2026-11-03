@@ -1,0 +1,110 @@
+import pandas as pd
+import requests
+import time
+import urllib.parse
+import os
+from bs4 import BeautifulSoup
+
+INPUT_FILE = 'steamdb-info-2026-10-29 - kopie.csv'
+OUTPUT_FILE = 'steam_games_with_tags.csv'
+BATCH_SAVE_INTERVAL = 50  # Slaat de voortgang op na elke 50 games
+
+def get_steam_tags(game_name):
+    """
+    Zoekt de game op via de Steam Search API en haalt de door gebruikers gekozen tags op.
+    """
+    search_url = f"https://store.steampowered.com/api/storesearch/?term={urllib.parse.quote(game_name)}&l=english&cc=US"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    try:
+        response = requests.get(search_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('items', [])
+            if items:
+                app_id = items[0]['id']
+                matched_title = items[0]['name']
+
+                # Bezoek de winkelpagina om de populaire user-defined tags te scrapen
+                store_url = f"https://store.steampowered.com/app/{app_id}/?l=english"
+                store_res = requests.get(store_url, headers=headers, timeout=10)
+
+                tags_list = []
+                if store_res.status_code == 200:
+                    soup = BeautifulSoup(store_res.text, 'html.parser')
+                    # Zoek naar de elementen met de class 'app_tag'
+                    tag_elements = soup.find_all('a', class_='app_tag')
+                    for elem in tag_elements:
+                        tag_text = elem.get_text().strip()
+                        if tag_text:
+                            tags_list.append(tag_text)
+
+                # Als het scrapen van de HTML niet is gelukt, vallen we terug op de genres van de API
+                if not tags_list:
+                    details_url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&l=english"
+                    details_res = requests.get(details_url, headers=headers, timeout=10)
+                    if details_res.status_code == 200:
+                        details_data = details_res.json()
+                        if details_data and str(app_id) in details_data and details_data[str(app_id)]['success']:
+                            app_info = details_data[str(app_id)]['data']
+                            if 'genres' in app_info:
+                                tags_list.extend([g['description'] for g in app_info['genres']])
+
+                unique_tags = list(dict.fromkeys(tags_list))
+                return app_id, matched_title, ", ".join(unique_tags)
+    except Exception as e:
+        print(f"Fout bij ophalen voor {game_name}: {e}")
+
+    return None, None, ""
+
+def main():
+    print(f"Laden van {INPUT_FILE}...")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        games = [line.strip().lstrip('\ufeff') for line in f if line.strip()]
+
+    print(f"Totaal {len(games)} games gevonden.")
+
+    # Controleer of er al een bestand is om verder te gaan waar het gebleven was
+    processed_games = set()
+    results = []
+
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            df_existing = pd.read_csv(OUTPUT_FILE)
+            processed_games = set(df_existing['Original_Name'].dropna())
+            results = df_existing.to_dict('records')
+            print(f"Bestaand bestand gevonden met {len(processed_games)} verwerkte games. Hervatten...")
+        except Exception as e:
+            print(f"Kan bestaand bestand niet lezen, start opnieuw. Fout: {e}")
+
+    for idx, game in enumerate(games, 1):
+        if game in processed_games:
+            continue
+
+        print(f"[{idx}/{len(games)}] Ophalen van tags voor: {game}")
+        app_id, matched_title, tags = get_steam_tags(game)
+
+        results.append({
+            'Original_Name': game,
+            'Steam_App_ID': app_id if app_id else "",
+            'Steam_Matched_Title': matched_title if matched_title else "",
+            'User_Tags': tags
+        })
+        processed_games.add(game)
+
+        # Ingebouwde pauze om IP-blocking door Steam te voorkomen
+        time.sleep(1.0)
+
+        # Sla elke 50 games tussentijds op
+        if len(results) % BATCH_SAVE_INTERVAL == 0:
+            df_temp = pd.DataFrame(results)
+            df_temp.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+            print(f"--- Voortgang opgeslagen ({len(results)} games verwerkt) ---")
+
+    # Eindresultaat opslaan
+    df_final = pd.DataFrame(results)
+    df_final.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+    print(f"Klaar! Resultaten opgeslagen in {OUTPUT_FILE}")
+
+if __name__ == '__main__':
+    main()
